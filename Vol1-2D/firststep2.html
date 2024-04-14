@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<title>WebGPU Life</title>
+	</head>
+	<body>
+		<canvas width="512" height="512"></canvas>
+		<script type="module">
+			//アダプターとデバイスをリクエストする
+			//WebGPUのためのインターフェースを取得
+			if(!navigator.gpu){
+				//ブラウザがWebGPUに対応してなければ例外発生
+				throw new Error("WebGPUはこのブラウザでサポートされていません");
+			}
+			//アダプターのリクエスト
+			//requestAdapterはPromiseで返ってくるため、awaitで待っておく
+			const adapter = await navigator.gpu.requestAdapter();
+			if(!adapter){
+				throw new Error("適切なGPUアダプタ(対応グラボ)がありません");
+			}
+
+			//デバイスのリクエスト
+			const dev = await adapter.requestDevice();
+			if(!dev){
+				throw new Error("デバイスの取得に失敗しました");
+			}
+
+			//WebGPUのグラフィクスを書き出すためのキャンバスの取得
+			const canvas=document.querySelector("canvas");
+			//ここでWebGPU用のコンテキストを取得する
+			const context=canvas.getContext("webgpu");
+
+			//現在のGPUキャンバスにとって最適なフォーマットを返す
+			const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+
+
+			//さて、この得られたデバイスとブラウザのキャンバスフォーマットを用いて
+			///WebGPUレンダリングに必要な設定を行います。
+			context.configure(
+				{
+					device : dev,
+					format : canvasFormat
+				}
+			);
+
+			//コマンドエンコーダの作成(DirectX12でいうCommandQueue+CommandList的なモノ)
+			const encoder=dev.createCommandEncoder();
+
+			//色構造体と、深度ステンシル構造体を設定する(他はオプショナル)
+			//3Dじゃないなら、深度ステンシルもオプショナル
+			var colAttach={
+				clearValue:[1.0,0.0,0.0,1.0],
+				loadOp:"clear",//画面はクリア
+				storeOp:"store",//変更は反映する
+				view:context.getCurrentTexture().createView()
+			};
+
+			//レンダーパスの開始
+			const pass = encoder.beginRenderPass({colorAttachments:[colAttach]});
+			pass.end();//レンダリングパスを終了
+
+			const commandBuffer=encoder.finish();//コマンドエンコーダの終了(とともにコマンドバッファを生成)
+			//そのコマンドバッファをコマンドキューに乗せ、GPU側に送信する
+			//なお、この関数自体は複数のコマンドバッファを想定しているため
+			//配列(コレクション)として送信する必要がある
+			dev.queue.submit([commandBuffer]);
+
+		</script>
+	</body>
+</html>

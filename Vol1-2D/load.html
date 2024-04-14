@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<title>Hello Triangle</title>
+	</head>
+	<body>
+		<canvas width="512" height="512" id="webgpucanvas"></canvas>
+		<script type="module">
+			const canvas = document.getElementById("webgpucanvas");
+			const ctx = canvas.getContext("2d");
+			const image = new Image();
+
+			// スプライトシートがロードされるのを待ちます
+			image.onload = () => {
+			Promise.all([
+				// スプライトシートから2つのスプライトを切り取ります
+				createImageBitmap(image, 0, 0, 1024, 1024),
+			]).then((sprites) => {
+				// 各スプライトをキャンバスに描きます
+				ctx.drawImage(sprites[0], 0, 0,512,512);
+			});
+			};
+			image.src = "./texture.jpg";
+		</script>
+	</body>
+</html>

@@ -1,0 +1,417 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<title>WebGPU Life</title>
+	</head>
+	<body>
+		<canvas width="1024" height="1024"></canvas>
+		<script type="module">
+		const GRID_SIZE=32;
+		const WORKGROUP_SIZE=8;
+		//アダプターとデバイスをリクエストする
+		//WebGPUのためのインターフェースを取得
+		if(!navigator.gpu){
+			//ブラウザがWebGPUに対応してなければ例外発生
+			throw new Error("WebGPUはこのブラウザでサポートされていません");
+		}
+		//アダプターのリクエスト
+		//requestAdapterはPromiseで返ってくるため、awaitで待っておく
+		const adapter = await navigator.gpu.requestAdapter();
+		if(!adapter){
+			throw new Error("適切なGPUアダプタ(対応グラボ)がありません");
+		}
+
+		//デバイスのリクエスト
+		const dev = await adapter.requestDevice();
+		if(!dev){
+			throw new Error("デバイスの取得に失敗しました");
+		}
+
+		//画像データのロード
+		const image=new Image();
+		image.src="./texture.jpg";
+		await image.decode();
+		const bitmap=await createImageBitmap(image);
+
+		//VRAMにテクスチャ領域を確保
+		const texture = dev.createTexture({
+							size:[bitmap.width,bitmap.height,1],//最後の1はテクスチャ配列数
+							format:"rgba8unorm",//フォーマット(RGBA8ビットを正規化)
+							usage:GPUTextureUsage.TEXTURE_BINDING | //テクスチャとして
+									GPUTextureUsage.COPY_DST | //コピー先として
+									GPUTextureUsage.RENDER_ATTACHMENT //レンダリング時に使う
+						});
+		
+		//GPU側へ画像データを転送
+		dev.queue.copyExternalImageToTexture(
+			{source:bitmap},//元データ
+			{texture:texture},//書き込み先テクスチャ
+			[bitmap.width,bitmap.height]//書きこみサイズ
+		);
+
+		//サンプラの作成
+		const sampler = dev.createSampler({
+			addressModeU: "repeat",//UV値が1を越えたら繰り返し
+			addressModeV: "repeat",//UV値が1を越えたら繰り返し
+			magFilter: "linear",//拡大時に線形補間
+			minFilter: "linear"//縮小時に線形補間
+		});
+
+		//WebGPUのグラフィクスを書き出すためのキャンバスの取得
+		const canvas=document.querySelector("canvas");
+		//ここでWebGPU用のコンテキストを取得する
+		const context=canvas.getContext("webgpu");
+		//現在のGPUキャンバスにとって最適なフォーマットを返す
+		const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+
+		//GPUに渡す用の画面解像度配列
+		const canvasSize=new Float32Array([canvas.width,canvas.height]);
+		const uniformBuffer = dev.createBuffer({
+			label : "Canvas Size Buffer",
+			size : canvasSize.byteLength,
+			usage : GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+		});
+		dev.queue.writeBuffer(uniformBuffer,0,canvasSize);
+
+		const CELL_SIZE=canvas.width/GRID_SIZE;
+		const vertices = new Float32Array([
+			// X,  Y,  				U,  V
+			 0,   0, 				0.0,  0.0,// 左上
+			 CELL_SIZE,   0,  		1.0,  0.0,// 右上
+			 0,  CELL_SIZE,  		0.0,  1.0,// 左下
+			 CELL_SIZE,  CELL_SIZE, 1.0,  1.0// 右下
+		]);
+
+		//頂点データを入れるための頂点バッファをGPU上(VRAM上)に確保する
+		const vertexBuffer = dev.createBuffer({
+			label : "Quad Vertices Buffer",//デバッグしやすくするための名前
+			size : vertices.byteLength,//サイズ
+			//頂点バッファとして使うしコピー先としても使う
+			usage : GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+		});
+
+		//GPU上の頂点バッファに頂点データを書き込む
+		//引数は書込先バッファ、オフセット、データ元、データオフセット(opt)、書込サイズ(opt)
+		dev.queue.writeBuffer(vertexBuffer,0,vertices);
+
+		//データ元
+		const cellArray = new Uint32Array(GRID_SIZE*GRID_SIZE);
+		//ComputeShaderから使えるストレージバッファを作成
+		const storageBuffers = [
+			dev.createBuffer({
+					label : "Storage Buffer",
+					size : cellArray.byteLength,
+					usage: GPUBufferUsage.STORAGE | 
+						GPUBufferUsage.VERTEX | 
+						GPUBufferUsage.COPY_DST
+				}),
+			dev.createBuffer({
+					label : "Storage Buffer",
+					size : cellArray.byteLength,
+					usage: GPUBufferUsage.STORAGE | 
+						GPUBufferUsage.VERTEX | 
+						GPUBufferUsage.COPY_DST
+				})];
+		for(var i=0;i<GRID_SIZE*GRID_SIZE;++i){
+			cellArray[i]=Math.random()>0.5?1:0;
+		}
+		dev.queue.writeBuffer(storageBuffers[0],0,cellArray);
+
+		//VertexBufferLayoutディクショナリをここで設定しておくことで、レンダリングパイプライン
+		//設定の時にlayoutを"auto"にしたときに、これに合わせてレイアウトしてくれるようになる
+		//これをやらない場合は、自前でレイアウトオブジェクトを作成することになり面倒くさい。
+		const vertexBufferLayout={
+			arrayStride : 16,//１頂点当たり何バイトか
+			attributes:[
+				{//頂点座標
+					format : "float32x2",//今回はfloat2つ(x,y)ぶん
+					offset : 0,//構造体の先頭からその属性までのオフセットをバイト単位で
+					shaderLocation:0,// @location(n)に対応
+				},
+				{//UV座標(New!!)
+					format : "float32x2",//今回はfloat2つ(x,y)ぶん
+					offset : 8,//構造体の先頭からその属性までのオフセットをバイト単位で
+					shaderLocation:1,// @location(n)に対応
+				}
+			]
+		};
+
+		const shaderCode=
+					`
+					
+						@group(0) @binding(0) var smp: sampler;
+						@group(0) @binding(1) var tex: texture_2d<f32>;	
+						@group(0) @binding(2) var<uniform> size : vec2f;	
+						@group(0) @binding(3) var<storage> cell:array<u32>;//New!!
+						struct VertexOutput{
+							@builtin(position) pos: vec4f,
+							@location(0) uv: vec2f
+						};
+						@vertex
+						fn vertexMain(@location(0) pos : vec2f, @location(1) uv : vec2f,
+									@builtin(instance_index) instanceId:u32) -> VertexOutput{
+							var out : VertexOutput;
+							let cellsize=f32(${CELL_SIZE});
+							let gridsize=u32(${GRID_SIZE});
+							let state=cell[instanceId];//セルの状態を取得(1:表示すべき,0:表示しない)
+							let x=f32(instanceId%gridsize)*cellsize+pos.x;
+							let y=f32(instanceId/gridsize)*cellsize+pos.y;
+							//もしセルが0なら大きさをゼロにして表示させないようにする
+							out.pos=vec4f(2*x/size.x-1,-2*y/size.y+1,0,1)*f32(state);
+							out.uv=uv;
+							return out;
+						}
+					
+
+						@fragment
+						fn fragmentMain(in:VertexOutput) -> @location(0) vec4f{
+							return textureSample(tex,smp,in.uv);
+						}
+					`;
+		//「シェーダモジュール」を生成する(WGSLオブジェクト)
+		//@vertex：シェーダステージを表す
+		//@builtin : 元々組み込まれている情報の種類
+		//@builtin(position)なら座標、@builtin(vertex_index)なら頂点インデックスを表す
+		//WGSLの文法はRustに近いため慣れが必要
+		//fn 関数名(引数) -> 戻り値 の形
+		const shaderModule = dev.createShaderModule({
+			label:"Simple Triangle Shader",//後々のデバッグで識別するためのラベル文字列
+			code : shaderCode//シェーダコード文字列
+		});
+
+		//レンダリングパイプラインを作成する
+		//各種オブジェクトを設定していく。深度ステンシル、フラグメント(ピクセル)、ラベル、レイアウト(必須)、
+		//マルチサンプル、プリミティブ、バーテックス(頂点で必須)に関するオブジェクトがある。
+		//まずは今回は初回なので、必須のレイアウト、およびラベル(デバッグ用)、バーテックス、ピクセルのみ設定する
+		//なお、レイアウトオブジェクトに関しては本来はcreatePipelineLayout()を使用して生成するが
+		//"auto"を指定しておけば、シェーダの内容から内部的に自動で生成してくれるため、今回はこれを利用します。
+		const pipeline = dev.createRenderPipeline({
+			label : "Simple Triangle pipeline",
+			layout : "auto",//単純な三角形なら"auto"でよい
+			
+			vertex : {
+				module : shaderModule,//WGSLオブジェクト
+				entryPoint : "vertexMain",//エントリポイント(頂点シェーダ実行時に最初に呼ばれる関数、main関数のようなもの)
+				buffers:[vertexBufferLayout]//buffers属性という名前なのだが、頂点レイアウトが入る
+			},
+			fragment:{
+				module:shaderModule,
+				entryPoint:"fragmentMain",//ピクセルシェーダのエントリポイント
+				targets:[{
+					format:canvasFormat//出力先のフォーマット(キャンバスのフォーマットにしておく)
+				}]
+			},
+			primitive : {topology:"triangle-strip"},//点と点の関係をひとつながりの三角形とみなす
+		});
+		//描画用バインドグループの作成
+		const bindGroups=[
+			dev.createBindGroup({
+				label : "Render Bind Group A",//ラベル
+				layout : pipeline.getBindGroupLayout(0),
+				entries : [
+					{//サンプラ[0]
+						binding:0,
+						resource:sampler
+					},
+					{//テクスチャ[1]
+						binding:1,
+						resource:texture.createView()
+					},
+					{//Uniformバッファ(サイズ)[2]
+						binding:2,
+						resource:{buffer:uniformBuffer}
+					},
+					{//Storaegバッファ(セル)[3]
+						binding:3,
+						resource:{buffer:storageBuffers[0]}
+					}
+				]
+			}),
+			dev.createBindGroup({
+				label : "Render Bind Group A",//ラベル
+				layout : pipeline.getBindGroupLayout(0),
+				entries : [
+					{//サンプラ[0]
+						binding:0,
+						resource:sampler
+					},
+					{//テクスチャ[1]
+						binding:1,
+						resource:texture.createView()
+					},
+					{//Uniformバッファ(サイズ)[2]
+						binding:2,
+						resource:{buffer:uniformBuffer}
+					},
+					{//Storaegバッファ(セル)[3]
+						binding:3,
+						resource:{buffer:storageBuffers[1]}
+					}
+				]
+			})];
+		//得られたデバイスとブラウザのキャンバスフォーマットを用いて
+		///WebGPUレンダリングに必要な設定を行います。
+		context.configure(
+			{
+				device : dev,
+				format : canvasFormat
+			}
+		);
+		
+		//コンピュートシェーダの作成
+		const computeShaderModule=dev.createShaderModule({
+		label : "Compute Shader",
+		code:`
+			@group(0) @binding(0) var<storage> cellBufferIn:array<u32>;//読み込み元
+			@group(0) @binding(1) var<storage,read_write> cellBufferOut:array<u32>;//書き込み先
+
+			fn cellActive(x:u32,y:u32)->u32{
+				let cellIndex=y*${GRID_SIZE}+x;
+				return cellBufferIn[cellIndex];
+			}
+
+			fn getActiveNeighbors(index : vec2u)->u32{
+				let activeNeighbors = cellActive(index.x+1,index.y+1)+
+										cellActive(index.x+1,index.y)+
+										cellActive(index.x+1,index.y-1)+
+										cellActive(index.x,index.y+1)+
+										cellActive(index.x,index.y-1)+
+										cellActive(index.x-1,index.y+1)+
+										cellActive(index.x-1,index.y)+
+										cellActive(index.x-1,index.y-1);
+				return activeNeighbors;
+			}
+
+			fn deadOrAlive(index : vec2u)->u32{
+				let activeNeighbors=getActiveNeighbors(index);
+				switch (activeNeighbors){
+					case 2:{
+						return cellBufferIn[index.y*${GRID_SIZE}+index.x];
+					}
+					case 3:{
+						return 1;
+					}
+					default:{
+						return 0;
+					}
+				}
+			}
+
+			@compute
+			@workgroup_size(${WORKGROUP_SIZE},${WORKGROUP_SIZE})
+			fn computeMain(@builtin(global_invocation_id) index : vec3u){
+				let cellIndex=index.y*${GRID_SIZE}+index.x;
+				cellBufferOut[cellIndex]=deadOrAlive(index.xy);
+			}
+		`
+		});
+		
+		//ComputeShader用のバインドグループレイアウト
+		const computeBindGroupLayout = dev.createBindGroupLayout({
+				label:"ComputeShader Layout",
+				entries:[
+					{
+						binding:0,
+						visibility:GPUShaderStage.COMPUTE,
+						buffer:{type:"read-only-storage"}
+					},
+					{
+						binding:1,
+						visibility:GPUShaderStage.COMPUTE,
+						buffer:{type:"storage"}
+					}
+				]
+			});
+
+		//ComputeShader用のバインドグループ
+		const computeBindGroups =[
+			dev.createBindGroup({
+				label : "ComputeShader BindGroup A",
+				layout : computeBindGroupLayout,
+				entries : [
+					{
+						binding:0,
+						resource:{buffer:storageBuffers[0]}
+					},
+					{
+						binding:1,
+						resource:{buffer:storageBuffers[1]}
+					}
+				]}),
+			dev.createBindGroup({
+				label : "ComputeShader BindGroup B",
+				layout : computeBindGroupLayout,
+				entries : [
+					{
+						binding:0,
+						resource:{buffer:storageBuffers[1]}
+					},
+					{
+						binding:1,
+						resource:{buffer:storageBuffers[0]}
+					}
+				]})
+		];
+
+		//コンピュートシェーダ用のパイプラインレイアウト
+		const computePipelineLayout=dev.createPipelineLayout({
+			label : "Compute Layout",
+			bindGroupLayouts:[computeBindGroupLayout]
+		});
+		//コンピュートシェーダ用パイプラインの作成
+		const computePipline=dev.createComputePipeline({
+			label:"ComputeShader pipeline",
+			layout:computePipelineLayout,
+			compute:{
+				module : computeShaderModule,
+				entryPoint : "computeMain"
+			}
+		});
+		var step=0;
+		setInterval(function(){
+			
+			//コマンドエンコーダの作成
+			const encoder=dev.createCommandEncoder();
+
+
+			const computePass = encoder.beginComputePass();
+			computePass.setPipeline(computePipline);
+			computePass.setBindGroup(0,computeBindGroups[step%2]);
+			const WORKGROUP_CNT = Math.ceil(GRID_SIZE/WORKGROUP_SIZE);
+			computePass.dispatchWorkgroups(WORKGROUP_CNT,WORKGROUP_CNT);
+			computePass.end();
+
+
+			//色構造体と、深度ステンシル構造体を設定する(他はオプショナル)
+			//3Dじゃないなら、深度ステンシルもオプショナル
+			var colAttach={
+				clearValue:[1.0,0.0,0.0,1.0],
+				loadOp:"clear",//画面はクリア
+				storeOp:"store",//変更は反映する
+				view:context.getCurrentTexture().createView()
+			};
+
+			//色構造体と、深度ステンシル構造体を設定する(他はオプショナル)
+			//3Dじゃないなら、深度ステンシルもオプショナル
+			const pass = encoder.beginRenderPass(
+				{
+					colorAttachments:[colAttach]
+				}
+			);
+			pass.setPipeline(pipeline);//レンダリングパイプラインのセット
+			pass.setBindGroup(0,bindGroups[step%2]);
+			pass.setVertexBuffer(0,vertexBuffer);//頂点バッファのセット(第一引数はスロット番号)
+			pass.draw(vertices.length/4,GRID_SIZE*GRID_SIZE);//セットされている頂点を、指定したパイプライン設定で描画
+
+			pass.end();//レンダリングパスを終了
+
+			const commandBuffer=encoder.finish();//コマンドエンコーダの終了(とともにコマンドバッファを生成)
+			dev.queue.submit([commandBuffer]);//そのコマンドバッファをコマンドキューに乗せ、GPU側に送信する
+			step++;
+		},500);
+
+
+		</script>
+	</body>
+</html>
